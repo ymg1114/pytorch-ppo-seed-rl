@@ -11,7 +11,7 @@ For a nice and practical solution, consider using **gRPC.**
 ## Caution!
 High CPU usage limits the scalability of worker nodes.
 
-Learning Environmen is limited to the discrete action space of `CartPole-v1`.
+Learning Environment is limited to the discrete action space of `CartPole-v1`.
 
 ## How to run
 `python main.py run_master`
