@@ -1,10 +1,8 @@
 import asyncio
 import numpy as np
-import torch.multiprocessing as mp
-# import multiprocessing as mp
 from collections import deque
 
-from .storage_module.shared_batch import SMInterFace
+from .storage_module.batch_memory import NdaMemInterFace
 
 from buffers.rollout_assembler import RolloutAssembler
 
@@ -17,15 +15,15 @@ from utils.utils import (
 )
 
 
-class LearnerStorage(SMInterFace):
+class LearnerStorage(NdaMemInterFace):
     def __init__(
         self,
         args,
-        shm_ref,
+        nda_ref,
         stop_event,
         obs_shape,
     ):
-        super().__init__(shm_ref=shm_ref)
+        super().__init__(nda_ref=nda_ref)
 
         self.args = args
         self.stop_event = stop_event
@@ -34,13 +32,13 @@ class LearnerStorage(SMInterFace):
         self.stat_publish_cycle = 50
         self.stat_q = deque(maxlen=self.stat_publish_cycle)
 
-        self.get_shared_memory_interface()
+        self.get_nda_memory_interface()
 
     @staticmethod
-    def entry_chain(self, data_queue: mp.Queue):
-        asyncio.run(self.shared_memory_chain(data_queue))
+    def entry_chain(self, data_queue: deque):
+        asyncio.run(self.memory_chain(data_queue))
 
-    async def shared_memory_chain(self, data_queue: mp.Queue):
+    async def memory_chain(self, data_queue: deque):
         self.rollout_assembler = RolloutAssembler(self.args, asyncio.Queue(1024))
 
         tasks = [
@@ -49,10 +47,12 @@ class LearnerStorage(SMInterFace):
         ]
         await asyncio.gather(*tasks)
 
-    async def retrieve_rollout_from_worker(self, data_queue: mp.Queue):
+    async def retrieve_rollout_from_worker(self, data_queue: deque):
+        stat_pub_num = 0 # 지역 변수
+        
         while not self.stop_event.is_set():
-            if not data_queue.empty():
-                protocol, data = data_queue.get()  # FIFO
+            if len(data_queue) > 0:
+                protocol, data = data_queue.popleft()  # FIFO
                 
                 if protocol is Protocol.Rollout:
                     await self.rollout_assembler.push(data)
@@ -97,7 +97,7 @@ class LearnerStorage(SMInterFace):
         sq = self.args.seq_len
         # bn = self.args.batch_size
 
-        num = self.sh_data_num.value
+        num = int(self.nda_data_num.item())
 
         sha = mul(self.obs_shape)
         ac = self.args.action_space
@@ -105,28 +105,28 @@ class LearnerStorage(SMInterFace):
 
         # buf = self.args.buffer_size
         mem_size = int(
-            self.sh_obs_batch.shape[0] / (sq * sha)
+            self.nda_obs_batch.shape[0] / (sq * sha)
         )  # TODO: 좋은 코드는 아닌 듯..
         # assert buf == mem_size
 
         if num < mem_size:
-            obs = rollout["obs"]
-            act = rollout["act"]
-            rew = rollout["rew"]
-            logits = rollout["logits"]
-            log_prob = rollout["log_prob"]
-            is_fir = rollout["is_fir"]
-            hx = rollout["hx"]
-            cx = rollout["cx"]
+            obs = rollout["obs"].cpu()
+            act = rollout["act"].cpu()
+            rew = rollout["rew"].cpu()
+            logits = rollout["logits"].cpu()
+            log_prob = rollout["log_prob"].cpu()
+            is_fir = rollout["is_fir"].cpu()
+            hx = rollout["hx"].cpu()
+            cx = rollout["cx"].cpu()
 
-            # 공유메모리에 학습 데이터 적재
-            self.sh_obs_batch[sq * num * sha : sq * (num + 1) * sha] = flatten(obs)
-            self.sh_act_batch[sq * num : sq * (num + 1)] = flatten(act)
-            self.sh_rew_batch[sq * num : sq * (num + 1)] = flatten(rew)
-            self.sh_logits_batch[sq * num * ac : sq * (num + 1) * ac] = flatten(logits)
-            self.sh_log_prob_batch[sq * num : sq * (num + 1)] = flatten(log_prob)
-            self.sh_is_fir_batch[sq * num : sq * (num + 1)] = flatten(is_fir)
-            self.sh_hx_batch[sq * num * hs : sq * (num + 1) * hs] = flatten(hx)
-            self.sh_cx_batch[sq * num * hs : sq * (num + 1) * hs] = flatten(cx)
+            # 메모리에 학습 데이터 적재
+            self.nda_obs_batch[sq * num * sha : sq * (num + 1) * sha] = flatten(obs)
+            self.nda_act_batch[sq * num : sq * (num + 1)] = flatten(act)
+            self.nda_rew_batch[sq * num : sq * (num + 1)] = flatten(rew)
+            self.nda_logits_batch[sq * num * ac : sq * (num + 1) * ac] = flatten(logits)
+            self.nda_log_prob_batch[sq * num : sq * (num + 1)] = flatten(log_prob)
+            self.nda_is_fir_batch[sq * num : sq * (num + 1)] = flatten(is_fir)
+            self.nda_hx_batch[sq * num * hs : sq * (num + 1) * hs] = flatten(hx)
+            self.nda_cx_batch[sq * num * hs : sq * (num + 1) * hs] = flatten(cx)
 
-            self.sh_data_num.value += 1
+            self.nda_data_num[:] += 1

@@ -1,4 +1,5 @@
-import os
+import os, sys
+import gc
 import gym
 import traceback
 
@@ -11,27 +12,29 @@ import torch.distributed.rpc as rpc
 from types import SimpleNamespace as SN
 from pathlib import Path
 
-from agents.storage_module.shared_batch import (
-    reset_shared_on_policy_memory,
-)
+from agents.storage_module.batch_memory import setup_nda_memory
 from agents.learner import (
     LearnerRPC,
 )
-from networks.models import (
-    MlpLSTMBase,
-)
+
 from utils.utils import (
     KillProcesses,
     Params,
     result_dir,
     model_dir,
-    extract_file_num,
-    ErrorComment,
     LEARNER_NAME,
     WORKER_NAME, 
     MASTER_ADDR, 
     MASTER_PORT,
 )
+
+
+fn_dict = {}
+
+
+def register(fn):
+    fn_dict[fn.__name__] = fn
+    return fn
 
 
 class Runner:
@@ -68,99 +71,61 @@ class Runner:
 
         # 이산 행동 분포 환경: openai-gym의 "CartPole-v1"
         assert len(env.observation_space.shape) <= 1
-
-        self.stop_event = mp.Event()
-
-        module_switcher = {  # (learner_cls, model_cls)
-            "PPO": SN(learner_cls=LearnerRPC, model_cls=MlpLSTMBase),
-        }
-        module_name_space = module_switcher.get(
-            self.args.algo, lambda: AssertionError(ErrorComment)
-        )
-
-        self.LearnerCls = module_name_space.learner_cls
-        self.ModelCls = module_name_space.model_cls
-
+        
         self.obs_shape = [env.observation_space.shape[0]]
         env.close()
 
         # num of Nodes
         self.world_size = self.args.num_worker + 1 # workers, learner
-        
-        self.Model = self.ModelCls(
-            *self.obs_shape, self.n_outputs, self.args.seq_len, self.args.hidden_size
-        )
-        
-        learner_model_state_dict = self.set_model_weight(self.args.model_dir)
-        if learner_model_state_dict is not None:
-            self.Model.load_state_dict(learner_model_state_dict)
-            
-        self.Model.to(torch.device("cpu"))  # cpu 모델
-
-    def set_model_weight(self, model_dir):
-        model_files = list(Path(model_dir).glob(f"{self.args.algo}_*.pt"))
-
-        prev_model_weight = None
-        if len(model_files) > 0:
-            sorted_files = sorted(model_files, key=extract_file_num)
-            if sorted_files:
-                prev_model_weight = torch.load(
-                    sorted_files[-1],
-                    map_location=torch.device("cpu"),  # 가장 최신 학습 모델 로드
-                )
-
-        learner_model_state_dict = self.Model.cpu().state_dict()
-        if prev_model_weight is not None:
-            learner_model_state_dict = {
-                k: v.cpu() for k, v in prev_model_weight.state_dict().items()
-            }
-
-        return learner_model_state_dict  # cpu 텐서
 
     def _start(self, rank):
         os.environ['MASTER_ADDR'] = MASTER_ADDR
-        os.environ['MASTER_PORT'] = str(MASTER_PORT)
+        os.environ['MASTER_PORT'] = MASTER_PORT
         
         # rank0 is the learner
         if rank == 0:
-            learner_name = LEARNER_NAME
-            options = rpc.TensorPipeRpcBackendOptions()
+            rpc.init_rpc(LEARNER_NAME, rank=rank, world_size=self.world_size)
             
-            device_map = {torch.device("cpu"): torch.device(self.args.device)} # {src: dst} / {local: remote}
-            options.set_device_map(learner_name, device_map)
-            
-            rpc.init_rpc(learner_name, rank=rank, world_size=self.world_size, rpc_backend_options=options)
+            # 학습을 위한 메모리 확보
+            nda_ref = setup_nda_memory(self.args, self.obs_shape, batch_size=self.args.batch_size)
 
-            # 학습을 위한 공유메모리 확보
-            shm_ref_switcher = {
-                "PPO": reset_shared_on_policy_memory,
-            }
-            shm_ref_factory = shm_ref_switcher.get(
-                self.args.algo, lambda: AssertionError(ErrorComment)
-            )
-            shm_ref = shm_ref_factory(self.args, self.obs_shape)
-            
-            learner = self.LearnerCls(self.args, self.Model, shm_ref, self.stop_event, self.obs_shape)
+            learner = LearnerRPC(self.args, nda_ref, self.obs_shape)
             learner.run()
             
         # workers passively waiting for instructions from learner
         else:
             remote_worker_name = WORKER_NAME.format(rank)
-            options = rpc.TensorPipeRpcBackendOptions()
-            
-            device_map = {torch.device(self.args.device): torch.device("cpu")} # {src: dst} / {local: remote}
-            options.set_device_map(remote_worker_name, device_map)
+            options = rpc.TensorPipeRpcBackendOptions(
+                num_worker_threads=4,
+            )
+            device_map = {torch.device("cpu"): torch.device(self.args.device)} # {src-node: callee-node}
+            options.set_device_map(LEARNER_NAME, device_map)
             
             rpc.init_rpc(remote_worker_name, rank=rank, world_size=self.world_size, rpc_backend_options=options)
 
+        # block until all rpcs finish
         rpc.shutdown()
 
+    @register
+    def run_master(self):
+        try:
+            self._start(rank=0) # rank of learner node is "0"
+            
+        except Exception as e:
+            print(f"error: {e}")
+            traceback.print_exc(limit=128)
 
-    def start(self):
+        finally:
+            rpc.shutdown() # Clean up RPC resources
+            gc.collect() # Force garbage collection
+            
+    @register
+    def run_slave(self):
         child_process = {}
 
-        try:            
-            for rank in range(self.world_size):
+        try:
+            # rank of worker node is "1~"
+            for rank in range(1, self.world_size):
                 p = mp.Process(target=self._start, args=(rank,))
                 child_process[rank] = p
 
@@ -171,9 +136,6 @@ class Runner:
                 p.join()
 
         except Exception as e:
-            # 자식 프로세스 종료 신호 보냄
-            self.stop_event.set()
-
             print(f"error: {e}")
             traceback.print_exc(limit=128)
 
@@ -183,7 +145,18 @@ class Runner:
                     p.join()
         finally:
             KillProcesses(os.getpid())
-
+            rpc.shutdown() # Clean up RPC resources
+            gc.collect() # Force garbage collection
+            
+    def start(self):
+        assert len(sys.argv) == 2
+        func_name = sys.argv[1]
+        
+        if func_name in fn_dict:
+            fn_dict[func_name](self)
+        else:
+            assert False, f"Wrong func_name: {func_name}"
+        
 
 if __name__ == "__main__":
     rn = Runner()

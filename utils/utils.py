@@ -1,5 +1,4 @@
 import os, sys
-import cv2
 import json
 import psutil
 import torch
@@ -49,8 +48,6 @@ def remote_method(method, rref, *args, **kwargs):
     """
     
     args = [method, rref] + list(args)
-    print(args)
-    print(kwargs)
     return rpc_sync(rref.owner(), call_method, args=args, kwargs=kwargs)
 
 
@@ -60,7 +57,6 @@ def remote_method_async(method, rref, *args, **kwargs):
     fetch back the result using RPC.
     """
     
-    # Prepare the arguments for the remote call
     args = [method, rref] + list(args)
     # Asynchronously call the `call_method` function on the remote node
     return rpc.rpc_async(rref.owner(), call_method, args=args, kwargs=kwargs)
@@ -110,6 +106,22 @@ class SingletonMetaCls(type):
         return cls.__instances[cls]
 
 
+def set_model_weight(args):
+    model_files = list(Path(args.model_dir).glob(f"{args.algo}_*.pt"))
+
+    prev_model_weight = None
+    if len(model_files) > 0:
+        sorted_files = sorted(model_files, key=extract_file_num)
+        if sorted_files:
+            prev_model_weight = torch.load(
+                sorted_files[-1],
+                map_location=torch.device("cpu"),  # 가장 최신 학습 모델 로드
+            )
+
+    if prev_model_weight is not None:
+        return {k: v.cpu() for k, v in prev_model_weight.state_dict().items()} # cpu 텐서
+
+
 # TODO: 이런 하드코딩 스타일은 바람직하지 않음. 더 좋은 코드 구조로 개선 필요.
 DataFrameKeyword = [
     "obs_batch",
@@ -134,7 +146,7 @@ ErrorComment = "Should be PPO"
 
 # Centralized One Master Node IP/PORT
 MASTER_ADDR = "localhost"
-MASTER_PORT = Params.master_port
+MASTER_PORT = str(Params.master_port)
 
 
 flatten = lambda obj: obj.numpy().reshape(-1).astype(np.float32)

@@ -23,6 +23,6 @@
     "loss_log_interval": 50,
     "model_save_interval": 100,
     "gpu_idx": 0,
-    "num_worker": 5,
-    "master_port": 23165
+    "num_worker": 15,
+    "master_port": 23163
 }

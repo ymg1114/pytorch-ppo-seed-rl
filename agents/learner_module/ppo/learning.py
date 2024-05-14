@@ -1,6 +1,6 @@
 import os
 import asyncio
-import time
+# import time
 import torch
 import torch.nn.functional as F
 from typing import TYPE_CHECKING
@@ -26,11 +26,6 @@ async def learning(parent, timer: ExecutionTimer):
                     obs, act, rew, _, behav_log_probs, is_fir, hx, cx = parent.to_gpu(
                         *batch_args
                     )
-                    # behav_log_probs = (
-                    #     parent.CT(F.softmax(logits, dim=-1))
-                    #     .log_prob(act.squeeze(-1))
-                    #     .unsqueeze(-1)
-                    # )
 
                     # epoch-learning
                     for _ in range(parent.args.K_epoch):
