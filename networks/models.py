@@ -5,6 +5,7 @@ import torch.jit as jit
 
 from torch import Tensor
 from torch.distributions import Categorical
+# from networks.categorical import Categorical
 
 from types import SimpleNamespace as SN
 from typing import Tuple
@@ -27,7 +28,16 @@ class MlpLSTM(nn.Module):
             nn.ReLU(),
         )
         self.after_torso()
-        
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Ensure JIT components are properly handled if necessary
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Reinitialize JIT components if necessary
+
     def after_torso(self):
         self.lstmcell = nn.LSTMCell(
             input_size=self.hidden_size, hidden_size=self.hidden_size
@@ -41,32 +51,42 @@ class MlpLSTM(nn.Module):
             in_features=self.hidden_size, out_features=self.n_outputs
         )
 
-    def get_dist(self, x):
-        logits = self.logits(x)
-        probs = F.softmax(logits, dim=-1)  # logits: (batch, feat)
-        return Categorical(probs)
+    @jit.ignore
+    def get_dist_info_act(self, probs: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action, dist.logits, dist.log_prob(action)
 
-    # @torch.jit.export
+    @jit.ignore
+    def get_dist_info_forward(self, probs: Tensor, behav_acts: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        dist = Categorical(probs)
+        return dist.logits, dist.log_prob(behav_acts), dist.entropy()
+
+    @jit.export
     def act(self, obs: Tensor, lstm_hxs: Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tuple[Tensor, Tensor]]:
         with torch.no_grad():
             x = self.body.forward(obs)  # x: (feat,)
             hx, cx = self.lstmcell(x, lstm_hxs)
 
-            dist = self.get_dist(hx)
-            action = dist.sample().detach()
+            logits = self.logits(hx)
+            probs = F.softmax(logits, dim=-1)  # logits: (batch, feat)
+
+            action, dist_logits, dist_log_prob = self.get_dist_info_act(probs)
 
         return (
             action,
-            dist.logits,
-            dist.log_prob(action),
+            dist_logits,
+            dist_log_prob,
             (hx, cx),
         )
 
-    # @torch.jit.export
+    @jit.export
     def forward(self, obs: Tensor, lstm_hxs: Tuple[Tensor, Tensor], behaviour_acts: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         batch, seq, *sha = self.batch_size, self.sequence_length, *self.input_size
         hx, cx = lstm_hxs
 
+        behav_acts = behaviour_acts.squeeze(-1)
+        
         obs = obs.contiguous().view(batch * seq, *sha)
         x = self.body.forward(obs)
         x = x.view(batch, seq, self.hidden_size)  # (batch, seq, hidden_size)
@@ -78,18 +98,14 @@ class MlpLSTM(nn.Module):
         output = torch.stack(output, dim=1)  # (batch, seq, feat)
 
         value = self.value(output)  # (batch, seq, 1)
-        dist = self.get_dist(output)  # (batch, seq, num_acts)
-
-        behav_acts = behaviour_acts.squeeze(-1)
-
-        log_probs = dist.log_prob(behav_acts)
-        entropy = dist.entropy()  # (batch, seq)
+        logits = self.logits(output)
+        probs = F.softmax(logits, dim=-1)  # logits: (batch, feat)
+        
+        dist_logits, dist_log_prob, dist_entropy = self.get_dist_info_forward(probs, behav_acts)
 
         return (
-            dist.logits.view(batch, seq, -1),
-            log_probs.view(batch, seq, -1),
-            entropy.view(batch, seq, -1),
+            dist_logits.view(batch, seq, -1),
+            dist_log_prob.view(batch, seq, -1),
+            dist_entropy.view(batch, seq, -1),
             value.view(batch, seq, -1),
         )
-        
-# JitModelInst = jit.script(MlpLSTM(arg=Parmas, env_space=EnvSpace))

@@ -6,7 +6,7 @@ from collections import deque, defaultdict
 from typing import List
 from functools import partial
 
-
+import torch.jit as jit
 import torch.distributed.rpc as rpc
 from torch.futures import Future
 from torch.optim import Adam, RMSprop
@@ -63,6 +63,7 @@ class LearnerRPC(NdaMemInterFace):
         
         self.device = self.args.device
         
+        # self.model = jit.script(MlpLSTM(args=Params, env_space=EnvSpace)).to(self.device)
         self.model = MlpLSTM(args=Params, env_space=EnvSpace).to(self.device)
         learner_model_state_dict = set_model_weight(self.args)
         if learner_model_state_dict is not None:

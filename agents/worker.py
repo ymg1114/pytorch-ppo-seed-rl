@@ -78,7 +78,7 @@ class WorkerRPC:
                 obs = next_obs
                 lstm_hx = lstm_hx_next
 
-                time.sleep(0.01)
+                time.sleep(0.05)
 
                 if done:
                     break
