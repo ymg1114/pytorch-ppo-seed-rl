@@ -5,7 +5,6 @@ import torch.jit as jit
 
 from torch import Tensor
 from torch.distributions import Categorical
-# from networks.categorical import Categorical
 
 from types import SimpleNamespace as SN
 from typing import Tuple
