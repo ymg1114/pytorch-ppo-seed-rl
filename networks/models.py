@@ -84,7 +84,7 @@ class MlpLSTM(nn.Module):
         batch, seq, *sha = self.batch_size, self.sequence_length, *self.input_size
         hx, cx = lstm_hxs
 
-        behav_acts = behaviour_acts.squeeze(-1)
+        behav_acts = behaviour_acts.long().squeeze(-1)
         
         obs = obs.contiguous().view(batch * seq, *sha)
         x = self.body.forward(obs)
