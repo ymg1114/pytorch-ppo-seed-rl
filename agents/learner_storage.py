@@ -10,8 +10,6 @@ from utils.utils import (
     Protocol,
     mul,
     flatten,
-    counted,
-
 )
 
 
@@ -24,15 +22,11 @@ class LearnerStorage(NdaMemInterFace):
         obs_shape,
     ):
         super().__init__(nda_ref=nda_ref)
-
+        self.get_nda_memory_interface()
+        
         self.args = args
         self.stop_event = stop_event
         self.obs_shape = obs_shape
-
-        self.stat_publish_cycle = 50
-        self.stat_q = deque(maxlen=self.stat_publish_cycle)
-
-        self.get_nda_memory_interface()
 
     @staticmethod
     def entry_chain(self, data_queue: deque):
@@ -48,27 +42,12 @@ class LearnerStorage(NdaMemInterFace):
         await asyncio.gather(*tasks)
 
     async def retrieve_rollout_from_worker(self, data_queue: deque):
-        stat_pub_num = 0 # 지역 변수
-        
         while not self.stop_event.is_set():
             if len(data_queue) > 0:
                 protocol, data = data_queue.popleft()  # FIFO
                 
-                if protocol is Protocol.Rollout:
-                    await self.rollout_assembler.push(data)
-                    
-                elif protocol is Protocol.Stat:
-                    self.stat_q.append(data)
-                    if stat_pub_num >= self.stat_publish_cycle and len(self.stat_q) > 0:
-    
-                        self.log_stat(
-                            {"log_len": len(self.stat_q), "mean_stat": np.mean([self.stat_q])}
-                        )
-                        stat_pub_num = 0
-                    stat_pub_num += 1
-                    
-                else:
-                    assert False, f"Wrong protocol: {protocol}"
+                assert protocol is Protocol.Rollout
+                await self.rollout_assembler.push(data) 
 
             await asyncio.sleep(0.001)
 
@@ -80,18 +59,6 @@ class LearnerStorage(NdaMemInterFace):
             print("rollout is poped !")
 
             await asyncio.sleep(0.001)
-
-    @counted
-    def log_stat(self, data):
-        _len = data["log_len"]
-        _epi_rew = data["mean_stat"]
-
-        tag = f"worker/{_len}-game-mean-stat-of-epi-rew"
-        x = self.log_stat.calls * _len  # global game counts
-        y = _epi_rew
-
-        print(f"tag: {tag}, y: {y}, x: {x}")
-
 
     def make_batch(self, rollout):
         sq = self.args.seq_len

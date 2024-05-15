@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import numpy as np
 import threading as th
 
 from collections import deque, defaultdict
@@ -25,6 +26,7 @@ from utils.utils import (
     to_torch,
     call_method,
     decode,
+    counted,
 )
 from env.proxy import EnvSpace
 
@@ -53,15 +55,18 @@ class LearnerRPC(NdaMemInterFace):
         
         self.args = args
         self.id = rpc.get_worker_info().id
+        self.device = self.args.device
         self.obs_shape = obs_shape
         
-        self.data_q = deque(maxlen=1024) # rollout, stat queue
         self.stop_event = th.Event() # condition
         
-        # Reset
         self.step_data = defaultdict(dict)
         
-        self.device = self.args.device
+        self.data_q = deque(maxlen=1024) # rollout queue
+        
+        self.stat_log_idx = 0
+        self.stat_log_cycle = 50
+        self.stat_q = deque(maxlen=self.stat_log_cycle) # stat queue
         
         # self.model = jit.script(MlpLSTM(args=Params, env_space=EnvSpace)).to(self.device)
         self.model = MlpLSTM(args=Params, env_space=EnvSpace).to(self.device)
@@ -82,6 +87,9 @@ class LearnerRPC(NdaMemInterFace):
         
         self.to_gpu = partial(make_gpu_batch, device=self.device)
         self.optimizer = RMSprop(self.model.parameters(), lr=self.args.lr, eps=1e-5)
+
+        from tensorboardX import SummaryWriter
+        self.writer = SummaryWriter(log_dir=args.result_dir)
 
     def run(self):        
         grand_child_thread = []
@@ -141,7 +149,6 @@ class LearnerRPC(NdaMemInterFace):
             # "id": _id,
         }
     
-    
     @staticmethod
     @rpc.functions.async_execution
     def act(learner_rref: RRef, wk_id, obs, lstm_hx):
@@ -173,8 +180,26 @@ class LearnerRPC(NdaMemInterFace):
             self.step_data[wk_id] = {} # transition 리셋
         else:
             assert protocol is Protocol.Stat
-            self.data_q.append((protocol, _data))
+            self.stat_q.append(_data)
             
+            if len(self.stat_q) > 0 and self.stat_log_idx % self.stat_log_cycle == 0:
+                self.log_stat(
+                    {"log_len": len(self.stat_q), "mean_stat": np.mean([self.stat_q])}
+                )
+                self.stat_log_idx = 0
+            self.stat_log_idx += 1
+            
+    @counted
+    def log_stat(self, data):
+        _len = data["log_len"]
+        _epi_rew = data["mean_stat"]
+
+        tag = f"worker/{_len}-game-mean-stat-of-epi-rew"
+        x = self.log_stat.calls * _len  # global game counts
+        y = _epi_rew
+
+        print(f"tag: {tag}, y: {y}, x: {x}")
+
     def sample_wrapper(func):
         def _wrap(self, sampling_method):
             sq = self.args.seq_len
@@ -251,3 +276,47 @@ class LearnerRPC(NdaMemInterFace):
             asyncio.create_task(self.put_batch_to_batch_q()),
         ]
         await asyncio.gather(*tasks)
+
+    def log_loss_tensorboard(self, timer: ExecutionTimer, loss, detached_losses):
+        self.writer.add_scalar("total-loss", float(loss.item()), self.idx)
+        
+        if "value-loss" in detached_losses:
+            self.writer.add_scalar(
+                "original-value-loss", detached_losses["value-loss"], self.idx
+            )
+
+        if "policy-loss" in detached_losses:
+            self.writer.add_scalar(
+                "original-policy-loss", detached_losses["policy-loss"], self.idx
+            )
+
+        if "policy-entropy" in detached_losses:
+            self.writer.add_scalar(
+                "original-policy-entropy", detached_losses["policy-entropy"], self.idx
+            )
+
+        if "ratio" in detached_losses:
+            self.writer.add_scalar(
+                "min-ratio", detached_losses["ratio"].min(), self.idx
+            )
+            self.writer.add_scalar(
+                "max-ratio", detached_losses["ratio"].max(), self.idx
+            )
+            self.writer.add_scalar(
+                "avg-ratio", detached_losses["ratio"].mean(), self.idx
+            )
+
+        if timer is not None and isinstance(timer, ExecutionTimer):
+            for k, v in timer.timer_dict.items():
+                self.writer.add_scalar(
+                    f"{k}-elapsed-mean-sec", sum(v) / (len(v) + 1e-6), self.idx
+                )
+            for k, v in timer.throughput_dict.items():
+                self.writer.add_scalar(
+                    f"{k}-transition-per-secs", sum(v) / (len(v) + 1e-6), self.idx
+                )
+        
+        if len(self.stat_q) >= self.stat_log_cycle:
+            self.writer.add_scalar(
+                f"worker/{len(self.stat_q)}-game-mean-stat-of-epi-rew", np.mean([self.stat_q]), self.idx
+            )

@@ -103,6 +103,9 @@ async def learning(parent, timer: ExecutionTimer):
                 # 인퍼런스 전용 모델 업데이트
                 parent.infer_model.load_state_dict(parent.model.state_dict())
 
+                if parent.idx % parent.args.loss_log_interval == 0:
+                    parent.log_loss_tensorboard(timer, loss, detached_losses)
+
                 if parent.idx % parent.args.model_save_interval == 0:
                     torch.save(
                         parent.model,
