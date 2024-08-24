@@ -63,6 +63,7 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
         self.stat_log_idx = 0
         self.stat_log_cycle = 50
         self.stat_q = deque(maxlen=self.stat_log_cycle)  # stat queue
+        self.lock = th.Lock()  # Lock 객체 생성
 
         self.model = jit.script(MlpLSTM(args=Params, env_space=EnvSpace)).to(
             self.device
@@ -118,28 +119,27 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
         lstm_hx = deserialize(request.lstm_hx)
         id_ = request.id
 
-        # 러너 서버 측에서 행동 출력
-        # GPU 인퍼런스
+        # 러너 서버 측에서 행동 출력 (GPU 인퍼런스)
         act, logits, log_prob, lstm_hx = self.infer_model.act(
             obs.to(self.device),
             (lstm_hx[0].to(self.device), lstm_hx[1].to(self.device)),
         )
 
-        # TODO: Lock..?
-        self.step_data[id_] = {
-            "obs": obs,  # (c, h, w) or (D,)
-            "act": act.view(-1),  # (1,) / not one-hot, but action index
-            # "rew": torch.from_numpy(
-            #     np.array([rew * self.args.reward_scale])
-            # ),  # (1,)
-            "logits": logits,
-            "log_prob": log_prob.view(-1),  # (1,) / scalar
-            # "is_fir": torch.FloatTensor([1.0 if is_fir else 0.0]),  # (1,),
-            # "done": torch.FloatTensor([1.0 if done else 0.0]),  # (1,),
-            "hx": lstm_hx[0],  # (hidden,)
-            "cx": lstm_hx[1],  # (hidden,)
-            # "id": _id,
-        }
+        with self.lock:  # Critical Section 보호
+            self.step_data[id_] = {
+                "obs": obs,  # (c, h, w) or (D,)
+                "act": act.view(-1),  # (1,) / not one-hot, but action index
+                # "rew": torch.from_numpy(
+                #     np.array([rew * self.args.reward_scale])
+                # ),  # (1,)
+                "logits": logits,
+                "log_prob": log_prob.view(-1),  # (1,) / scalar
+                # "is_fir": torch.FloatTensor([1.0 if is_fir else 0.0]),  # (1,),
+                # "done": torch.FloatTensor([1.0 if done else 0.0]),  # (1,),
+                "hx": lstm_hx[0],  # (hidden,)
+                "cx": lstm_hx[1],  # (hidden,)
+                # "id": _id,
+            }
 
         # 응답 메시지 생성
         act_response = Pb2.ActResponse(
@@ -159,30 +159,35 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
             done = data_request.done
             id_ = data_request.id
 
-            self.step_data[id_]["rew"] = torch.from_numpy(np.array([rew]))
-            self.step_data[id_]["is_fir"] = torch.tensor([1.0 if is_fir else 0.0])
-            self.step_data[id_]["done"] = torch.tensor([1.0 if done else 0.0])
-            self.step_data[id_]["id"] = id_
+            with self.lock:  # Critical Section 보호
+                self.step_data[id_]["rew"] = torch.from_numpy(np.array([rew]))
+                self.step_data[id_]["is_fir"] = torch.tensor([1.0 if is_fir else 0.0])
+                self.step_data[id_]["done"] = torch.tensor([1.0 if done else 0.0])
+                self.step_data[id_]["id"] = id_
 
-            # TODO: Lock..?
-            self.data_q.append((Protocol.Rollout, self.step_data[id_]))
-
-            self.step_data[id_] = {}  # transition 리셋
+                self.data_q.append((Protocol.Rollout, self.step_data[id_]))
+                self.step_data[id_] = {}  # transition 리셋
 
         elif request.HasField("stat_request"):
             stat_request = request.stat_request
             epi_rew = stat_request.epi_rew
             id_ = stat_request.id
 
-            self.stat_q.append(epi_rew)
+            with self.lock:  # Critical Section 보호
+                self.stat_q.append(epi_rew)
 
-            if len(self.stat_q) > 0 and self.stat_log_idx % self.stat_log_cycle == 0:
-                self.log_stat(
-                    {"log_len": len(self.stat_q), "mean_stat": np.mean([self.stat_q])}
-                )
-                self.stat_log_idx = 0
-            self.stat_log_idx += 1
-
+                if (
+                    len(self.stat_q) > 0
+                    and self.stat_log_idx % self.stat_log_cycle == 0
+                ):
+                    self.log_stat(
+                        {
+                            "log_len": len(self.stat_q),
+                            "mean_stat": np.mean([self.stat_q]),
+                        }
+                    )
+                    self.stat_log_idx = 0
+                self.stat_log_idx += 1
         else:
             assert False, f"Wrong gRPC request from Client -> Server: {request}"
         return Pb2.Empty()
