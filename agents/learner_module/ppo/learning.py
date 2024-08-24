@@ -109,7 +109,7 @@ async def learning(parent, timer: ExecutionTimer):
 
                 if parent.idx % parent.args.model_save_interval == 0:
                     torch.save(
-                        parent.model,
+                        parent.model.state_dict(),
                         os.path.join(
                             parent.args.model_dir, f"{parent.args.algo}_{parent.idx}.pt"
                         ),

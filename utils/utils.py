@@ -44,9 +44,7 @@ def set_model_weight(args):
             )
 
     if prev_model_weight is not None:
-        return {
-            k: v.cpu() for k, v in prev_model_weight.state_dict().items()
-        }  # cpu 텐서
+        return {k: v.cpu() for k, v in prev_model_weight.items()}  # cpu 텐서
 
 
 # TODO: 이런 하드코딩 스타일은 바람직하지 않음. 더 좋은 코드 구조로 개선 필요.

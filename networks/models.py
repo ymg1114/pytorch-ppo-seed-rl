@@ -28,14 +28,14 @@ class MlpLSTM(nn.Module):
         )
         self.after_torso()
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        # Ensure JIT components are properly handled if necessary
-        return state
+    # def __getstate__(self):
+    #     state = self.__dict__.copy()
+    #     # Ensure JIT components are properly handled if necessary
+    #     return state
 
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        # Reinitialize JIT components if necessary
+    # def __setstate__(self, state):
+    #     self.__dict__.update(state)
+    #     # Reinitialize JIT components if necessary
 
     def after_torso(self):
         self.lstmcell = nn.LSTMCell(

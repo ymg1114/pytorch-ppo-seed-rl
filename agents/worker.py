@@ -81,7 +81,7 @@ class WorkerRPC:
 
                 is_fir = False
 
-                time.sleep(0.05)
+                time.sleep(0.1)
 
                 if done:
                     break
