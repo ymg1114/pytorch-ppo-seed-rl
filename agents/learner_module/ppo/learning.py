@@ -1,5 +1,6 @@
 import os
 import asyncio
+
 # import time
 import torch
 import torch.nn.functional as F
@@ -99,7 +100,7 @@ async def learning(parent, timer: ExecutionTimer):
                                 )
                             )
                             parent.optimizer.step()
-                            
+
                 # 인퍼런스 전용 모델 업데이트
                 parent.infer_model.load_state_dict(parent.model.state_dict())
 

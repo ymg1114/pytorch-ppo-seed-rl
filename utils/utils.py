@@ -20,8 +20,6 @@ from datetime import datetime
 from signal import SIGTERM  # or SIGKILL
 from types import SimpleNamespace
 
-import torch.distributed.rpc as rpc
-from torch.distributed.rpc import RRef, rpc_sync, rpc_async, remote
 
 utils = os.path.join(os.getcwd(), "utils", "parameters.json")
 with open(utils) as f:
@@ -31,79 +29,6 @@ with open(utils) as f:
 
 WORKER_NAME = "Worker{}"
 LEARNER_NAME = "Learner"
-
-
-def call_method(method, rref, *args, **kwargs):
-    r"""
-    a helper function to call a method on the given RRef
-    """
-
-    return method(rref.local_value(), *args, **kwargs)
-
-
-def remote_method(method, rref, *args, **kwargs):
-    r"""
-    a helper function to run method on the owner of rref and fetch back the
-    result using RPC
-    """
-    
-    args = [method, rref] + list(args)
-    return rpc_sync(rref.owner(), call_method, args=args, kwargs=kwargs)
-
-
-def remote_method_async(method, rref, *args, **kwargs):
-    """
-    A helper function to asynchronously run a method on the owner of rref and
-    fetch back the result using RPC.
-    """
-    
-    args = [method, rref] + list(args)
-    # Asynchronously call the `call_method` function on the remote node
-    return rpc.rpc_async(rref.owner(), call_method, args=args, kwargs=kwargs)
-
-
-async def to_asyncio_future(torch_future):
-    """Convert a PyTorch Future to an asyncio Future.
-    
-    Example Usages)
-    
-    async def main():
-        # Assuming rpc is properly initialized and there is a remote node available
-        rref = rpc.remote("worker1", some_remote_class)
-        
-        # Asynchronously call a method and await its result
-        torch_future = remote_method_async(some_method, rref, arg1, arg2)
-        result = await to_asyncio_future(torch_future)
-        
-        print(f"Result from remote method: {result}")
-        
-    # Initialize RPC, run the main function, and then shut down RPC
-    if __name__ == "__main__":
-        rpc.init_rpc("worker0", rank=0, world_size=2)
-        asyncio.run(main())
-        rpc.shutdown()
-    """
-    
-    loop = asyncio.get_event_loop()
-    asyncio_future = loop.create_future()
-
-    def copy_result(future):
-        if future.exception():
-            loop.call_soon_threadsafe(asyncio_future.set_exception, future.exception())
-        else:
-            loop.call_soon_threadsafe(asyncio_future.set_result, future.wait())
-
-    torch_future.then(copy_result)
-    return asyncio_future
-
-
-class SingletonMetaCls(type):
-    __instances = {}
-
-    def __call__(cls, *args, **kwargs):
-        if cls not in cls.__instances:
-            cls.__instances[cls] = super().__call__(*args, **kwargs)
-        return cls.__instances[cls]
 
 
 def set_model_weight(args):
@@ -119,7 +44,9 @@ def set_model_weight(args):
             )
 
     if prev_model_weight is not None:
-        return {k: v.cpu() for k, v in prev_model_weight.state_dict().items()} # cpu 텐서
+        return {
+            k: v.cpu() for k, v in prev_model_weight.state_dict().items()
+        }  # cpu 텐서
 
 
 # TODO: 이런 하드코딩 스타일은 바람직하지 않음. 더 좋은 코드 구조로 개선 필요.
@@ -144,9 +71,9 @@ model_dir = os.path.join(result_dir, "models")
 ErrorComment = "Should be PPO"
 
 
-# Centralized One Master Node IP/PORT
-MASTER_ADDR = "localhost"
-MASTER_PORT = str(Params.master_port)
+# Centralized One Learner Server IP/PORT
+SERVER_IP = "localhost"
+SERVER_PORT = str(Params.server_port)
 
 
 flatten = lambda obj: obj.numpy().reshape(-1).astype(np.float32)
@@ -156,6 +83,16 @@ to_torch = lambda nparray: torch.from_numpy(nparray).type(torch.float32)
 
 
 to_cpu_tensor = lambda *data: tuple(d.cpu() for d in data)
+
+
+# 직렬화 함수
+def serialize(data):
+    return pickle.dumps(data)
+
+
+# 역직렬화 함수
+def deserialize(serialized_data):
+    return pickle.loads(serialized_data)
 
 
 def extract_file_num(filename):
@@ -264,14 +201,6 @@ def KillProcesses(pid):
     ):  # or parent.children() for recursive=False
         child.kill()
     parent.kill()
-
-
-def encode(protocol, data):
-    return pickle.dumps(protocol), blosc2.compress(pickle.dumps(data), clevel=1)
-
-
-def decode(protocol, data):
-    return pickle.loads(protocol), pickle.loads(blosc2.decompress(data))
 
 
 if __name__ == "__main__":

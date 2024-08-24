@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package pytorch_ppo_seed_rl;
+
+// 메시지 정의
+
+message ActRequest {
+    bytes obs = 1;
+    bytes lstm_hx = 2;
+    string id = 3; // Worker id + epi. id
+}
+
+message ActResponse {
+    bytes act = 1;
+    bytes logits = 2;
+    bytes log_prob = 3;
+    bytes lstm_hx = 4;
+}
+
+message ReportDataRequest {
+    float rew = 1;
+    bool is_fir = 2;
+    bool done = 3;
+    string id = 4; // Worker id + epi. id
+}
+
+message ReportStatRequest {
+    float epi_rew = 1;
+    string id = 2; // Worker id + epi. id
+}
+
+message ReportRequest {
+    oneof report_type {
+        ReportDataRequest data_request = 1;
+        ReportStatRequest stat_request = 2;
+    }
+}
+
+message Empty {
+}
+
+// 분산 학습 서비스 정의
+service RunnerService {
+    rpc Act(ActRequest) returns (ActResponse);
+    rpc Report(ReportRequest) returns (Empty);
+}

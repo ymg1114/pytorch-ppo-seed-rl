@@ -23,8 +23,9 @@ class LearnerStorage(NdaMemInterFace):
     ):
         super().__init__(nda_ref=nda_ref)
         self.get_nda_memory_interface()
-        
+
         self.args = args
+        self.aioLock = asyncio.Lock()
         self.stop_event = stop_event
         self.obs_shape = obs_shape
 
@@ -43,11 +44,12 @@ class LearnerStorage(NdaMemInterFace):
 
     async def retrieve_rollout_from_worker(self, data_queue: deque):
         while not self.stop_event.is_set():
-            if len(data_queue) > 0:
-                protocol, data = data_queue.popleft()  # FIFO
-                
-                assert protocol is Protocol.Rollout
-                await self.rollout_assembler.push(data) 
+            async with self.aioLock:
+                if len(data_queue) > 0:
+                    protocol, data = data_queue.popleft()  # FIFO
+
+                    assert protocol is Protocol.Rollout
+                    await self.rollout_assembler.push(data)
 
             await asyncio.sleep(0.001)
 

@@ -6,9 +6,7 @@ from utils.utils import mul, DataFrameKeyword
 def ndarray_memory(nda_ref: dict, np_array: np.ndarray, name: str):
     assert name in DataFrameKeyword
 
-    nda_ref.update(
-        {name: np_array.astype(np.float32)}
-    )
+    nda_ref.update({name: np_array.astype(np.float32)})
 
 
 def setup_nda_memory(args, obs_shape, batch_size):
@@ -53,7 +51,7 @@ def setup_nda_memory(args, obs_shape, batch_size):
     ndarray_memory(nda_ref, cx_batch, "cx_batch")
 
     # 메모리 저장 인덱스
-    nda_data_num = np.array([0], dtype=np.float32) # 초기화
+    nda_data_num = np.array([0], dtype=np.float32)  # 초기화
     nda_ref.update({"batch_index": nda_data_num})
     return nda_ref
 

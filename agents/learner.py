@@ -7,134 +7,126 @@ from collections import deque, defaultdict
 from typing import List
 from functools import partial
 
+import torch
 import torch.jit as jit
-import torch.distributed.rpc as rpc
 from torch.futures import Future
 from torch.optim import Adam, RMSprop
-from torch.nn.parallel import DistributedDataParallel
-from torch.distributed.rpc import RRef, rpc_sync, rpc_async, remote
 
 from networks.models import MlpLSTM
 
 from utils.utils import (
-    WORKER_NAME,
     set_model_weight,
     Protocol,
     make_gpu_batch,
     ExecutionTimer,
     Params,
     to_torch,
-    call_method,
-    decode,
     counted,
 )
 from env.proxy import EnvSpace
 
-from agents.worker import WorkerRPC
 from agents.learner_storage import LearnerStorage
+
+from buffers import grpc_service_pb2 as Pb2
+from buffers import grpc_service_pb2_grpc as Pb2gRPC
 
 from .storage_module.batch_memory import NdaMemInterFace
 from . import (
     ppo_awrapper,
 )
 
+from utils.utils import serialize, deserialize
+
 timer = ExecutionTimer(
     num_transition=Params.seq_len * Params.batch_size * 1
 )  # Learner에서 데이터 처리량 (학습)
 
 
-class LearnerRPC(NdaMemInterFace):
+class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
     def __init__(
         self,
         args,
         nda_ref,
         obs_shape,
     ):
-        super().__init__(nda_ref=nda_ref)
+        NdaMemInterFace.__init__(self, nda_ref=nda_ref)
         self.get_nda_memory_interface()
-        
+
         self.args = args
-        self.id = rpc.get_worker_info().id
         self.device = self.args.device
         self.obs_shape = obs_shape
-        
-        self.stop_event = th.Event() # condition
-        
+
+        self.stop_event = th.Event()  # condition
         self.step_data = defaultdict(dict)
-        
-        self.data_q = deque(maxlen=1024) # rollout queue
-        
+        self.data_q = deque(maxlen=1024)  # rollout queue
+
         self.stat_log_idx = 0
         self.stat_log_cycle = 50
-        self.stat_q = deque(maxlen=self.stat_log_cycle) # stat queue
-        
-        # self.model = jit.script(MlpLSTM(args=Params, env_space=EnvSpace)).to(self.device)
-        self.model = MlpLSTM(args=Params, env_space=EnvSpace).to(self.device)
+        self.stat_q = deque(maxlen=self.stat_log_cycle)  # stat queue
+
+        self.model = jit.script(MlpLSTM(args=Params, env_space=EnvSpace)).to(
+            self.device
+        )
+        # self.model = MlpLSTM(args=Params, env_space=EnvSpace).to(self.device)
         learner_model_state_dict = set_model_weight(self.args)
         if learner_model_state_dict is not None:
             self.model.load_state_dict(learner_model_state_dict)
-            
+
         self.infer_model = copy.deepcopy(self.model)
         self.infer_model.eval()
-        
-        # Setting Remote Reference
-        self.learner_rref = RRef(self)
-        self.wk_rrefs = []
-        for i, wk_rank in enumerate(range(1, args.num_worker+1)): # worker-node + learner-node
-            wk_name = "worker_" + str(i)
-            wk_info = rpc.get_worker_info(WORKER_NAME.format(wk_rank))
-            self.wk_rrefs.append(remote(wk_info, WorkerRPC, args=(args, wk_name,)))
-        
+
         self.to_gpu = partial(make_gpu_batch, device=self.device)
         self.optimizer = RMSprop(self.model.parameters(), lr=self.args.lr, eps=1e-5)
 
-        from tensorboardX import SummaryWriter
+        from torch.utils.tensorboard import SummaryWriter
+
         self.writer = SummaryWriter(log_dir=args.result_dir)
 
-    def run(self):        
-        grand_child_thread = []
-        
+    def run(self):
+        self.child_thread = []
+
         storage = LearnerStorage(
             self.args,
             self.nda_ref,
             self.stop_event,
             self.obs_shape,
         )
-        t1 = th.Thread(target=storage.entry_chain, args=(storage, self.data_q, ), daemon=True)
+        t1 = th.Thread(
+            target=storage.entry_chain,
+            args=(
+                storage,
+                self.data_q,
+            ),
+            daemon=True,
+        )
         t2 = th.Thread(target=self.entry_chain, daemon=True)
-        grand_child_thread.extend([t1, t2])
-        
-        for gcp in grand_child_thread:
-            gcp.start()
+        self.child_thread.extend([t1, t2])
 
-        LearnerRPC.run_rref_worker(self.wk_rrefs, self.learner_rref)
- 
-        # for gcp in grand_child_thread:
-        #     gcp.join()
+        for ct in self.child_thread:
+            ct.start()
+
+    def join(self):
+        for ct in self.child_thread:
+            ct.join()
 
     def entry_chain(self):
         asyncio.run(self.learning_chain_ppo())
 
-    @staticmethod
-    def run_rref_worker(wk_rrefs: List[RRef], learner_rref: RRef):
-        futs = []
-        for wk_rref in wk_rrefs:
-            # make async RPC to kick off an episode on all observers
-            futs.append(
-                rpc_async(
-                    wk_rref.owner(),
-                    call_method,
-                    args=(WorkerRPC.gene_rollout, wk_rref, learner_rref),
-                    timeout=0,
-                )
-            )
-        for fut in futs:
-            fut.wait()
+    def Act(self, request, context):
+        # 각 워커 클라이언트로부터 받은 데이터를 역직렬화
+        obs = deserialize(request.obs)
+        lstm_hx = deserialize(request.lstm_hx)
+        id_ = request.id
 
-    def proxy_step_data(self, wk_id, obs, lstm_hx, results):
-        act, logits, log_prob, _ = results
-        
-        self.step_data[wk_id] = {
+        # 러너 서버 측에서 행동 출력
+        # GPU 인퍼런스
+        act, logits, log_prob, lstm_hx = self.infer_model.act(
+            obs.to(self.device),
+            (lstm_hx[0].to(self.device), lstm_hx[1].to(self.device)),
+        )
+
+        # TODO: Lock..?
+        self.step_data[id_] = {
             "obs": obs,  # (c, h, w) or (D,)
             "act": act.view(-1),  # (1,) / not one-hot, but action index
             # "rew": torch.from_numpy(
@@ -148,47 +140,53 @@ class LearnerRPC(NdaMemInterFace):
             "cx": lstm_hx[1],  # (hidden,)
             # "id": _id,
         }
-    
-    @staticmethod
-    @rpc.functions.async_execution
-    def act(learner_rref: RRef, wk_id, obs, lstm_hx):
-        self = learner_rref.local_value()
-        
-        future = Future()
-        
-        def handle_result(results):
-            _results = results.wait()
-            self.proxy_step_data(wk_id, obs, lstm_hx, _results)
-        
-        future.then(handle_result) # future.wait() 결과 추가 라우팅
-        future.set_result(self.infer_model.act(obs, lstm_hx))
-        return future
-    
-    @staticmethod
-    def report_data(learner_rref: RRef, wk_id, data):
-        self = learner_rref.local_value()
-        
-        protocol, _data = decode(*data)
-        if protocol is Protocol.Rollout:
-            self.step_data[wk_id]["rew"] = _data["rew"]
-            self.step_data[wk_id]["is_fir"] = _data["is_fir"]
-            self.step_data[wk_id]["done"] = _data["done"]
-            self.step_data[wk_id]["id"] = _data["id"]
-            
-            self.data_q.append((protocol, self.step_data[wk_id]))
-    
-            self.step_data[wk_id] = {} # transition 리셋
-        else:
-            assert protocol is Protocol.Stat
-            self.stat_q.append(_data)
-            
+
+        # 응답 메시지 생성
+        act_response = Pb2.ActResponse(
+            act=serialize(act),
+            logits=serialize(logits),
+            log_prob=serialize(log_prob),
+            lstm_hx=serialize(lstm_hx),
+        )
+        return act_response
+
+    def Report(self, request, context):
+        # ReportRequest의 oneof 필드를 처리
+        if request.HasField("data_request"):
+            data_request = request.data_request
+            rew = data_request.rew
+            is_fir = data_request.is_fir
+            done = data_request.done
+            id_ = data_request.id
+
+            self.step_data[id_]["rew"] = torch.from_numpy(np.array([rew]))
+            self.step_data[id_]["is_fir"] = torch.tensor([1.0 if is_fir else 0.0])
+            self.step_data[id_]["done"] = torch.tensor([1.0 if done else 0.0])
+            self.step_data[id_]["id"] = id_
+
+            # TODO: Lock..?
+            self.data_q.append((Protocol.Rollout, self.step_data[id_]))
+
+            self.step_data[id_] = {}  # transition 리셋
+
+        elif request.HasField("stat_request"):
+            stat_request = request.stat_request
+            epi_rew = stat_request.epi_rew
+            id_ = stat_request.id
+
+            self.stat_q.append(epi_rew)
+
             if len(self.stat_q) > 0 and self.stat_log_idx % self.stat_log_cycle == 0:
                 self.log_stat(
                     {"log_len": len(self.stat_q), "mean_stat": np.mean([self.stat_q])}
                 )
                 self.stat_log_idx = 0
             self.stat_log_idx += 1
-            
+
+        else:
+            assert False, f"Wrong gRPC request from Client -> Server: {request}"
+        return Pb2.Empty()
+
     @counted
     def log_stat(self, data):
         _len = data["log_len"]
@@ -279,7 +277,7 @@ class LearnerRPC(NdaMemInterFace):
 
     def log_loss_tensorboard(self, timer: ExecutionTimer, loss, detached_losses):
         self.writer.add_scalar("total-loss", float(loss.item()), self.idx)
-        
+
         if "value-loss" in detached_losses:
             self.writer.add_scalar(
                 "original-value-loss", detached_losses["value-loss"], self.idx
@@ -315,8 +313,10 @@ class LearnerRPC(NdaMemInterFace):
                 self.writer.add_scalar(
                     f"{k}-transition-per-secs", sum(v) / (len(v) + 1e-6), self.idx
                 )
-        
+
         if len(self.stat_q) >= self.stat_log_cycle:
             self.writer.add_scalar(
-                f"worker/{len(self.stat_q)}-game-mean-stat-of-epi-rew", np.mean([self.stat_q]), self.idx
+                f"worker/{len(self.stat_q)}-game-mean-stat-of-epi-rew",
+                np.mean([self.stat_q]),
+                self.idx,
             )

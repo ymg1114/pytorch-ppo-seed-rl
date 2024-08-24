@@ -1,12 +1,13 @@
 # pytorch-ppo-seed-rl
 
 
-## Using torch.distributed.rpc for Remote Procedure Calls (RPC)
-Note: This package is deprecated and no longer supported.
+## Brief Overview
+This implementation uses **gRPC** to support the **SEED RL** architecture.
 
-This implementation serves as a reference for the overall program architecture.
+## Generate gRPC Stub Code
+To generate the gRPC stub code from the `.proto` file, you can use the following command
 
-For a nice and practical solution, consider using **gRPC.**
+`python -m grpc_tools.protoc -I=buffers --python_out=buffers --grpc_python_out=buffers buffers/grpc_service.proto`
 
 ## Caution!
 High CPU usage limits the scalability of worker nodes.
@@ -14,6 +15,6 @@ High CPU usage limits the scalability of worker nodes.
 Learning Environment is limited to the discrete action space of `CartPole-v1`.
 
 ## How to run
-`python main.py run_master`
+`python main.py run_server`
 
-`python main.py run_slave`
+`python main.py run_client`
