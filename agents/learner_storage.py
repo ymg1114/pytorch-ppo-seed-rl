@@ -1,6 +1,6 @@
 import asyncio
 import numpy as np
-from collections import deque
+# from collections import deque
 
 from .storage_module.batch_memory import NdaMemInterFace
 
@@ -29,11 +29,7 @@ class LearnerStorage(NdaMemInterFace):
         self.stop_event = stop_event
         self.obs_shape = obs_shape
 
-    @staticmethod
-    def entry_chain(self, data_queue: deque):
-        asyncio.run(self.memory_chain(data_queue))
-
-    async def memory_chain(self, data_queue: deque):
+    async def memory_chain(self, data_queue: asyncio.Queue):
         self.rollout_assembler = RolloutAssembler(self.args, asyncio.Queue(1024))
 
         tasks = [
@@ -42,11 +38,11 @@ class LearnerStorage(NdaMemInterFace):
         ]
         await asyncio.gather(*tasks)
 
-    async def retrieve_rollout_from_worker(self, data_queue: deque):
+    async def retrieve_rollout_from_worker(self, data_queue: asyncio.Queue):
         while not self.stop_event.is_set():
             async with self.aioLock:
-                if len(data_queue) > 0:
-                    protocol, data = data_queue.popleft()  # FIFO
+                if data_queue.qsize() > 0:
+                    protocol, data = await data_queue.get()  # FIFO
 
                     assert protocol is Protocol.Rollout
                     await self.rollout_assembler.push(data)

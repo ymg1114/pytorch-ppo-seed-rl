@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import time
+import grpc
 import numpy as np
 import threading as th
 
@@ -47,23 +49,25 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
         self,
         args,
         nda_ref,
+        stop_event,
         obs_shape,
     ):
         NdaMemInterFace.__init__(self, nda_ref=nda_ref)
         self.get_nda_memory_interface()
 
         self.args = args
+        self.num_worker = args.num_worker # 개별 클라이언트 프로세스 개수
         self.device = self.args.device
         self.obs_shape = obs_shape
 
-        self.stop_event = th.Event()  # condition
+        self.stop_event = stop_event  # condition
         self.step_data = defaultdict(dict)
-        self.data_q = deque(maxlen=1024)  # rollout queue
 
         self.stat_log_idx = 0
         self.stat_log_cycle = 50
-        self.stat_q = deque(maxlen=self.stat_log_cycle)  # stat queue
-        self.lock = th.Lock()  # Lock 객체 생성
+        
+        self.batch_event = asyncio.Event()
+        self.lock = asyncio.Lock()  # Lock 객체 생성
 
         self.model = jit.script(MlpLSTM(args=Params, env_space=EnvSpace)).to(
             self.device
@@ -79,12 +83,20 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
         self.to_gpu = partial(make_gpu_batch, device=self.device)
         self.optimizer = RMSprop(self.model.parameters(), lr=self.args.lr, eps=1e-5)
 
+        # processing: 요청이 처리 중인 상태인지 확인
+        # request: 클라이언트 요청 데이터 저장
+        # response: 클라이언트 응답 데이터 저장
+        self.client_states = defaultdict(lambda: {"request": None, "response": None, "processing": False})
+
         from torch.utils.tensorboard import SummaryWriter
 
         self.writer = SummaryWriter(log_dir=args.result_dir)
 
-    def run(self):
-        self.child_thread = []
+    # TODO: 클라이언트 사이드 보다, 러너 (서버) 사이드의 프로그램을 먼저 실행시키고, 웜업 시간을 잠시 가져야 함
+    async def run_async(self):
+        self.batch_queue = asyncio.Queue(1024)
+        self.data_q = asyncio.Queue(maxsize=1024)  # rollout queue
+        self.stat_q = asyncio.Queue(maxsize=self.stat_log_cycle)  # stat queue
 
         storage = LearnerStorage(
             self.args,
@@ -92,105 +104,163 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
             self.stop_event,
             self.obs_shape,
         )
-        t1 = th.Thread(
-            target=storage.entry_chain,
-            args=(
-                storage,
-                self.data_q,
-            ),
-            daemon=True,
-        )
-        t2 = th.Thread(target=self.entry_chain, daemon=True)
-        self.child_thread.extend([t1, t2])
 
-        for ct in self.child_thread:
-            ct.start()
+        tasks = [
+            asyncio.create_task(storage.memory_chain(self.data_q)),
+            asyncio.create_task(self.learning_ppo()),
+            asyncio.create_task(self.put_batch_to_batch_q()),
+            asyncio.create_task(self.batch_processor()),
+        ]
+        await asyncio.gather(*tasks)
+        
+    async def Act(self, request, context):
+        client_id = request.id
 
-    def join(self):
-        for ct in self.child_thread:
-            ct.join()
+        # 요청 동기화: 중복 요청 방지
+        async with self.lock:
+            c_status = self.client_states[client_id]
+            assert "request" in c_status
+            assert "response" in c_status
+            assert "processing" in c_status
 
-    def entry_chain(self):
-        asyncio.run(self.learning_chain_ppo())
+            if c_status["processing"]:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"Client {client_id} already has a pending request.")
+                raise RuntimeError(f"Client {client_id} has a pending request.")
+                # return Pb2.ActResponse()  # 빈 응답
 
-    def Act(self, request, context):
-        # 각 워커 클라이언트로부터 받은 데이터를 역직렬화
-        obs = deserialize(request.obs)
-        lstm_hx = deserialize(request.lstm_hx)
-        id_ = request.id
+            # 요청 저장 및 상태 갱신
+            c_status["request"] = request
+            c_status["processing"] = True  # 처리 상태 진입
 
-        # 러너 서버 측에서 행동 출력 (GPU 인퍼런스)
-        act, logits, log_prob, lstm_hx = self.infer_model.act(
-            obs.to(self.device),
-            (lstm_hx[0].to(self.device), lstm_hx[1].to(self.device)),
-        )
+            # 배치 처리 준비 상태 확인
+            if sum(status["processing"] for status in self.client_states.values()) >= self.num_worker:
+                self.batch_event.set()
 
-        with self.lock:  # Critical Section 보호
-            self.step_data[id_] = {
-                "obs": obs,  # (c, h, w) or (D,)
-                "act": act.view(-1),  # (1,) / not one-hot, but action index
-                # "rew": torch.from_numpy(
-                #     np.array([rew * self.args.reward_scale])
-                # ),  # (1,)
-                "logits": logits,
-                "log_prob": log_prob.view(-1),  # (1,) / scalar
-                # "is_fir": torch.FloatTensor([1.0 if is_fir else 0.0]),  # (1,),
-                # "done": torch.FloatTensor([1.0 if done else 0.0]),  # (1,),
-                "hx": lstm_hx[0],  # (hidden,)
-                "cx": lstm_hx[1],  # (hidden,)
-                # "id": _id,
-            }
+        # 응답 대기
+        while not c_status["response"]:
+            await asyncio.sleep(1e-5)
 
-        # 응답 메시지 생성
-        act_response = Pb2.ActResponse(
-            act=serialize(act),
-            logits=serialize(logits),
-            log_prob=serialize(log_prob),
-            lstm_hx=serialize(lstm_hx),
-        )
-        return act_response
+        # 응답 반환
+        async with self.lock:
+            res = c_status["response"]
+            c_status["response"] = None  # 응답 초기화
+            c_status["processing"] = False  # 처리 상태 탈출
 
-    def Report(self, request, context):
-        # ReportRequest의 oneof 필드를 처리
-        if request.HasField("data_request"):
-            data_request = request.data_request
-            rew = data_request.rew
-            is_fir = data_request.is_fir
-            done = data_request.done
-            id_ = data_request.id
+        return res
 
-            with self.lock:  # Critical Section 보호
-                self.step_data[id_]["rew"] = torch.from_numpy(np.array([rew]))
-                self.step_data[id_]["is_fir"] = torch.tensor([1.0 if is_fir else 0.0])
-                self.step_data[id_]["done"] = torch.tensor([1.0 if done else 0.0])
-                self.step_data[id_]["id"] = id_
+    async def batch_processor(self):
+        while True:
+            # 배치 크기만큼 요청 대기
+            await self.batch_event.wait()
 
-                self.data_q.append((Protocol.Rollout, self.step_data[id_]))
-                self.step_data[id_] = {}  # transition 리셋
+            # 배치 처리
+            async with self.lock:  # Critical Section 보호
+                # 요청 데이터 수집 및 변환
+                batch, client_ids = [], []
+                for client_id, status in self.client_states.items():
+                    request = status["request"]
+                    obs = deserialize(request.obs)
+                    lstm_hx = deserialize(request.lstm_hx)
+                    batch.append((obs, lstm_hx))
+                    client_ids.append(client_id)
 
-        elif request.HasField("stat_request"):
-            stat_request = request.stat_request
-            epi_rew = stat_request.epi_rew
-            id_ = stat_request.id
+                # 배치 데이터 준비
+                obs_batch = torch.stack([obs.to(self.device) for obs, _ in batch])
+                lstm_hx_batch = (
+                    torch.stack([hx[0].to(self.device) for _, hx in batch]),
+                    torch.stack([hx[1].to(self.device) for _, hx in batch]),
+                )
 
-            with self.lock:  # Critical Section 보호
-                self.stat_q.append(epi_rew)
+                # 배치 inference 수행 (GPU 인퍼런스)
+                acts, logits, log_probs, lstm_hxs = self.infer_model.act(obs_batch, lstm_hx_batch)
 
-                if (
-                    len(self.stat_q) > 0
-                    and self.stat_log_idx % self.stat_log_cycle == 0
+                # 배치 응답 메시지 생성 및 저장
+                for idx, (act, logit, log_prob, lstm_hx) in enumerate(
+                    zip(acts, logits, log_probs, zip(*lstm_hxs))
                 ):
-                    self.log_stat(
-                        {
-                            "log_len": len(self.stat_q),
-                            "mean_stat": np.mean([self.stat_q]),
-                        }
+                    client_id = client_ids[idx]
+                    obs, _ = batch[idx]
+
+                    # 클라이언트 상태 데이터 저장
+                    self.step_data[client_id] = {
+                        "obs": obs, # (c, h, w) or (D,)
+                        "act": act.view(-1), # (1,)
+                        "logits": logit,
+                        "log_prob": log_prob.view(-1), # (1,)
+                        "hx": lstm_hx[0], # (hidden,)
+                        "cx": lstm_hx[1], # (hidden,) 
+                    }
+
+                    # 클라이언트 응답 준비
+                    self.client_states[client_id]["response"] = Pb2.ActResponse(
+                        act=serialize(act),
+                        logits=serialize(logit),
+                        log_prob=serialize(log_prob),
+                        lstm_hx=serialize(lstm_hx),
                     )
-                    self.stat_log_idx = 0
-                self.stat_log_idx += 1
-        else:
-            assert False, f"Wrong gRPC request from Client -> Server: {request}"
+
+                    self.client_states[client_id]["request"] = None  # 요청 초기화
+
+                # 배치 이벤트 초기화
+                self.batch_event.clear()
+
+            await asyncio.sleep(1e-5)
+
+    async def Report(self, request, context):
+        # ReportRequest의 oneof 필드를 처리
+        async with self.lock:  # Critical Section 보호
+            if request.HasField("data_request"):
+                data_request = request.data_request
+                rew = data_request.rew
+                is_fir = data_request.is_fir
+                done = data_request.done
+                client_id = data_request.id
+
+                self.step_data[client_id]["rew"] = torch.from_numpy(np.array([rew]))
+                self.step_data[client_id]["is_fir"] = torch.tensor([1.0 if is_fir else 0.0])
+                self.step_data[client_id]["done"] = torch.tensor([1.0 if done else 0.0])
+                self.step_data[client_id]["id"] = client_id
+                
+                await self.data_q.put((Protocol.Rollout, self.step_data[client_id]))
+                self.step_data[client_id] = {}  # transition 리셋
+
+            elif request.HasField("stat_request"):
+                stat_request = request.stat_request
+                epi_rew = stat_request.epi_rew
+                client_id = stat_request.id
+
+                await self.process_statistics(epi_rew)
+
+                # 해당 경기 리스트 플레이스홀더 제거
+                self.step_data.pop(client_id)
+                self.client_states.pop(client_id)
+            else:
+                assert False, f"Wrong gRPC request from Client -> Server: {request}"
         return Pb2.Empty()
+
+    async def process_statistics(self, epi_rew):
+        # 통계 데이터를 큐에 추가
+        await self.stat_q.put(epi_rew)
+
+        if (
+            self.stat_q.qsize() > 0  # 큐에 데이터가 있는지 확인
+            and self.stat_log_idx % self.stat_log_cycle == 0
+        ):
+            # 큐에서 모든 데이터를 꺼내 평균 계산
+            stats = []
+            while not self.stat_q.empty():
+                stats.append(await self.stat_q.get())
+
+            # 로그 작성
+            self.log_stat(
+                {
+                    "log_len": len(stats),
+                    "mean_stat": np.mean(stats),
+                }
+            )
+            self.stat_log_idx = 0
+        self.stat_log_idx += 1
 
     @counted
     def log_stat(self, data):
@@ -272,15 +342,7 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
 
             await asyncio.sleep(0.001)
 
-    async def learning_chain_ppo(self):
-        self.batch_queue = asyncio.Queue(1024)
-        tasks = [
-            asyncio.create_task(self.learning_ppo()),
-            asyncio.create_task(self.put_batch_to_batch_q()),
-        ]
-        await asyncio.gather(*tasks)
-
-    def log_loss_tensorboard(self, timer: ExecutionTimer, loss, detached_losses):
+    async def log_loss_tensorboard(self, timer: ExecutionTimer, loss, detached_losses):
         self.writer.add_scalar("total-loss", float(loss.item()), self.idx)
 
         if "value-loss" in detached_losses:
@@ -319,9 +381,15 @@ class LearnerRPC(Pb2gRPC.RunnerServiceServicer, NdaMemInterFace):
                     f"{k}-transition-per-secs", sum(v) / (len(v) + 1e-6), self.idx
                 )
 
-        if len(self.stat_q) >= self.stat_log_cycle:
+        if self.stat_q.qsize() >= self.stat_log_cycle:
+            stats = []
+            # 큐에서 데이터를 꺼내 리스트로 수집
+            while not self.stat_q.empty():
+                stats.append(await self.stat_q.get())
+
+            # 평균값 계산 후 TensorBoard에 기록
             self.writer.add_scalar(
-                f"worker/{len(self.stat_q)}-game-mean-stat-of-epi-rew",
-                np.mean([self.stat_q]),
+                f"worker/{len(stats)}-game-mean-stat-of-epi-rew",
+                np.mean(stats),
                 self.idx,
             )

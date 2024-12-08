@@ -105,7 +105,7 @@ async def learning(parent, timer: ExecutionTimer):
                 parent.infer_model.load_state_dict(parent.model.state_dict())
 
                 if parent.idx % parent.args.loss_log_interval == 0:
-                    parent.log_loss_tensorboard(timer, loss, detached_losses)
+                    await parent.log_loss_tensorboard(timer, loss, detached_losses)
 
                 if parent.idx % parent.args.model_save_interval == 0:
                     torch.save(

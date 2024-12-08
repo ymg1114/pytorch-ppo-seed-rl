@@ -1,11 +1,13 @@
 import os, sys
 import gc
 import gym
+import asyncio
 import traceback
 
-import grpc
+# import grpc
+from grpc.aio import server as aio_server # 비동기 서버 생성
 import torch
-import torch.multiprocessing as mp
+import multiprocessing as mp
 
 from concurrent import futures
 from types import SimpleNamespace as SN
@@ -78,45 +80,90 @@ class Runner:
         self.obs_shape = [env.observation_space.shape[0]]
         env.close()
 
+    @staticmethod
+    async def stop_server(server):
+        """gRPC 서버 종료 메서드"""
+        
+        await server.shutdown()
+        await server.wait_for_termination()
+
+    @staticmethod
+    async def start_learner_proxy(args, obs_shape):
+        """학습 프로세스와 서버 실행"""
+        
+        stop_event = asyncio.Event()
+
+        # 학습을 위한 공유 메모리 확보
+        nda_ref = setup_nda_memory(
+            args, obs_shape, batch_size=args.batch_size
+        )
+
+        learner = LearnerRPC(
+            args,
+            nda_ref,
+            stop_event,
+            obs_shape,
+        )
+
+        # gRPC 서버 초기화
+        aserver = aio_server()
+        Pb2gRPC.add_RunnerServiceServicer_to_server(learner, aserver)
+        aserver.add_insecure_port(f"[::]:{SERVER_PORT}")
+
+        try:
+            # 비동기 작업 실행
+            await asyncio.gather(
+                aserver.start(),
+                learner.run_async(),
+                aserver.wait_for_termination(),
+            )
+        except asyncio.CancelledError:
+            print("Server tasks cancelled.")
+        except Exception as e:
+            print(f"Error in learner proxy: {e}")
+            traceback.print_exc()
+        finally:
+            await Runner.stop_server(aserver)  # 명시적으로 서버 종료
+
+    @staticmethod
+    def start_learner(args, obs_shape):
+        """동기식 인터페이스에서 비동기 서버 실행"""
+        
+        asyncio.run(Runner.start_learner_proxy(args, obs_shape))
+
     @register
     def run_server(self):
+        """서버 실행 진입점"""
+        
         try:
-            # 학습을 위한 공유 메모리 확보
-            nda_ref = setup_nda_memory(
-                self.args, self.obs_shape, batch_size=self.args.batch_size
-            )
-            learner = LearnerRPC(self.args, nda_ref, self.obs_shape)
-            learner.run()
-
-            server = grpc.server(
-                futures.ThreadPoolExecutor(max_workers=self.args.num_worker)
-            )
-            Pb2gRPC.add_RunnerServiceServicer_to_server(learner, server)
-            server.add_insecure_port(f"[::]:{SERVER_PORT}")
-            server.start()
-            server.wait_for_termination()
-
-            learner.join()
-
+            Runner.start_learner(self.args, self.obs_shape)
         except Exception as e:
-            print(f"error: {e}")
+            print(f"Error in server: {e}")
             traceback.print_exc(limit=128)
-
         finally:
             gc.collect()  # Force garbage collection
 
     @staticmethod
     def start_worker(args, worker_id):
-        worker = WorkerRPC(args, f"Worker-{worker_id}")
-        worker.gene_rollout()
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # 워커 객체를 프로세스 내부에서 생성
+            worker = WorkerRPC(args, f"Worker-{worker_id}")
+            loop.run_until_complete(worker.gene_rollout())
+        except Exception as e:
+            print(f"Error in Worker-{worker_id}: {e}")
+            traceback.print_exc()
+        finally:
+            loop.close()
 
     @register
     def run_client(self):
         child_process = {}
 
         try:
-            # rank of worker node is "1~"
-            for rank in range(1, self.args.num_worker):
+            for rank in range(self.args.num_worker):
                 p = mp.Process(target=Runner.start_worker, args=(self.args, rank))
                 child_process[rank] = p
 
@@ -127,7 +174,7 @@ class Runner:
                 p.join()
 
         except Exception as e:
-            print(f"error: {e}")
+            print(f"Error: {e}")
             traceback.print_exc(limit=128)
 
             for r, p in child_process.items():
